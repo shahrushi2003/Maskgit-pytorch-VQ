@@ -10,6 +10,7 @@ class DummyLoss(nn.Module):
 
 class VQWithMSELoss(nn.Module):
     def __init__(self, codebook_weight):
+        super().__init__()
         self.codebook_weight = codebook_weight
         self.mse_loss = nn.MSELoss()
 
