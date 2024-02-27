@@ -3,19 +3,19 @@ import torch.nn.functional as F
 import pytorch_lightning as pl
 
 
-from Network.Taming.util import instantiate_from_config
+from Network.Taming.modules.losses.mse import VQWithMSELoss
 
 from Network.Taming.modules.diffusionmodules.model import Encoder, Decoder
 from Network.Taming.modules.vqvae.quantize import VectorQuantizer2 as VectorQuantizer
 
 
-class VQModel(pl.LightningModule):
+class VQVAE(pl.LightningModule):
     def __init__(
         self,
         ddconfig,
-        lossconfig,
         n_embed,
         embed_dim,
+        codebook_weight,
         ckpt_path=None,
         ignore_keys=[],
         image_key="image",
@@ -30,7 +30,7 @@ class VQModel(pl.LightningModule):
         self.embed_dim = embed_dim
         self.encoder = Encoder(**ddconfig)
         self.decoder = Decoder(**ddconfig)
-        # self.loss = instantiate_from_config(lossconfig)
+        self.loss = VQWithMSELoss(codebook_weight)
         self.quantize = VectorQuantizer(
             n_embed,
             embed_dim,
@@ -48,6 +48,8 @@ class VQModel(pl.LightningModule):
             self.register_buffer("colorize", torch.randn(3, colorize_nlabels, 1, 1))
         if monitor is not None:
             self.monitor = monitor
+
+        # self.automatic_optimization = False
 
     def init_from_ckpt(self, path, ignore_keys=list()):
         sd = torch.load(path, map_location="cpu")["state_dict"]
@@ -92,82 +94,40 @@ class VQModel(pl.LightningModule):
         x = x.permute(0, 3, 1, 2).to(memory_format=torch.contiguous_format)
         return x.float()
 
-    def training_step(self, batch, batch_idx, optimizer_idx):
+    def training_step(self, batch, batch_idx):
         x = self.get_input(batch, self.image_key)
         xrec, qloss = self(x)
 
-        if optimizer_idx == 0:
-            # autoencode
-            aeloss, log_dict_ae = self.loss(
-                qloss,
-                x,
-                xrec,
-                optimizer_idx,
-                self.global_step,
-                last_layer=self.get_last_layer(),
-                split="train",
-            )
+        loss, log_dict = self.loss(qloss, x, xrec, split="train")
 
-            self.log(
-                "train/aeloss",
-                aeloss,
-                prog_bar=True,
-                logger=True,
-                on_step=True,
-                on_epoch=True,
-            )
-            self.log_dict(
-                log_dict_ae, prog_bar=False, logger=True, on_step=True, on_epoch=True
-            )
-            return aeloss
-
-        if optimizer_idx == 1:
-            # discriminator
-            discloss, log_dict_disc = self.loss(
-                qloss,
-                x,
-                xrec,
-                optimizer_idx,
-                self.global_step,
-                last_layer=self.get_last_layer(),
-                split="train",
-            )
-            self.log(
-                "train/discloss",
-                discloss,
-                prog_bar=True,
-                logger=True,
-                on_step=True,
-                on_epoch=True,
-            )
-            self.log_dict(
-                log_dict_disc, prog_bar=False, logger=True, on_step=True, on_epoch=True
-            )
-            return discloss
+        self.log(
+            "train/loss",
+            loss,
+            prog_bar=True,
+            logger=True,
+            on_step=True,
+            on_epoch=True,
+        )
+        self.log_dict(
+            log_dict, prog_bar=False, logger=True, on_step=True, on_epoch=True
+        )
+        return loss
 
     def validation_step(self, batch, batch_idx):
         x = self.get_input(batch, self.image_key)
         xrec, qloss = self(x)
-        aeloss, log_dict_ae = self.loss(
-            qloss,
-            x,
-            xrec,
-            0,
-            self.global_step,
-            last_layer=self.get_last_layer(),
-            split="val",
-        )
 
-        discloss, log_dict_disc = self.loss(
-            qloss,
-            x,
-            xrec,
-            1,
-            self.global_step,
-            last_layer=self.get_last_layer(),
-            split="val",
+        loss, log_dict = self.loss(qloss, x, xrec, split="val")
+
+        self.log(
+            "val/loss",
+            loss,
+            prog_bar=True,
+            logger=True,
+            on_step=True,
+            on_epoch=True,
         )
-        rec_loss = log_dict_ae["val/rec_loss"]
+        rec_loss = log_dict["val/rec_loss"]
         self.log(
             "val/rec_loss",
             rec_loss,
@@ -175,20 +135,11 @@ class VQModel(pl.LightningModule):
             logger=True,
             on_step=True,
             on_epoch=True,
-            sync_dist=True,
         )
-        self.log(
-            "val/aeloss",
-            aeloss,
-            prog_bar=True,
-            logger=True,
-            on_step=True,
-            on_epoch=True,
-            sync_dist=True,
+        self.log_dict(
+            log_dict, prog_bar=False, logger=True, on_step=True, on_epoch=True
         )
-        self.log_dict(log_dict_ae)
-        self.log_dict(log_dict_disc)
-        return self.log_dict
+        return loss, xrec
 
     def configure_optimizers(self):
         lr = self.learning_rate
@@ -201,13 +152,7 @@ class VQModel(pl.LightningModule):
             lr=lr,
             betas=(0.5, 0.9),
         )
-        opt_disc = torch.optim.Adam(
-            self.loss.discriminator.parameters(), lr=lr, betas=(0.5, 0.9)
-        )
-        return [opt_ae, opt_disc], []
-
-    def get_last_layer(self):
-        return self.decoder.conv_out.weight
+        return opt_ae
 
     def log_images(self, batch, **kwargs):
         log = dict()
